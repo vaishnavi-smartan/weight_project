@@ -1,0 +1,34 @@
+# ─────────────────────────────────────────────────────────────────
+# Gym Equipment Detection — Requirements
+# Python 3.8+ recommended
+# ─────────────────────────────────────────────────────────────────
+
+# Core deep learning & YOLO
+ultralytics>=8.0.0
+torch>=2.0.0
+torchvision>=0.15.0
+
+# Computer vision
+opencv-python>=4.7.0
+
+# Experiment tracking
+mlflow>=2.10.0
+
+# Data / config
+numpy>=1.24.0
+pyyaml>=6.0
+
+# Utilities (used internally by ultralytics / mlflow)
+Pillow>=9.0.0
+tqdm>=4.64.0
+pandas>=1.5.0
+matplotlib>=3.5.0
+scipy>=1.9.0
+seaborn>=0.12.0
+
+# ─────────────────────────────────────────────────────────────────
+# Optional — GPU (CUDA 11.8)
+# Uncomment and replace torch/torchvision above with:
+# torch==2.1.0+cu118 --extra-index-url https://download.pytorch.org/whl/cu118
+# torchvision==0.16.0+cu118 --extra-index-url https://download.pytorch.org/whl/cu118
+# ─────────────────────────────────────────────────────────────────
