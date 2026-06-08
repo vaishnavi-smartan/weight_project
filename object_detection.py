@@ -3,32 +3,22 @@ train_v9n.py  –  Gym Equipment YOLO trainer  (v9n — YOLOv8n + CPU-safe)
 Dataset  : Roboflow — dumbells-and-kettlebells (v15)
 Classes  : bb, db, kb, medicine ball, plates  (nc=5)
 
-════════════════════════════════════════════════════════════════════
-  WHAT CHANGED vs v8 (yolov8m)
-════════════════════════════════════════════════════════════════════
-  1. MODEL  ─ Switched from yolov8m.pt → yolov8n.pt (nano).
-              ~8× fewer parameters (3.2M vs 25.9M).
-              Faster iteration on CPU (pc-008 has no working GPU).
-              Trade-off: lower mAP ceiling vs medium, especially
-              for small/minority classes like plates.
 
-  2. BATCH  ─ Lowered default to 8 (was 16).
+  1. BATCH  ─ Lowered default to 8 (was 16).
               Nano fits comfortably in CPU RAM at batch=8.
               Raise to 16 if your machine has ≥32 GB RAM.
 
-  3. WORKERS ─ Lowered to 2 (was 4).
+  2. WORKERS ─ Lowered to 2 (was 4).
                On CPU training, excess workers add overhead
                without throughput gain.
 
-  4. DROPOUT ─ Head dropout reduced to 0.05 (was 0.10).
+  3. DROPOUT ─ Head dropout reduced to 0.05 (was 0.10).
                Nano has fewer parameters; aggressive dropout
                hurts convergence more than it helps regularise.
                Backbone dropout kept at 0.0 (nano has none anyway).
 
-  5. AUGMENTATION TUNED for nano + CPU:
+  4. AUGMENTATION TUNED for nano + CPU:
                • copy_paste=0.6   kept  — still critical for plates
-               • erasing=0.3      kept  — texture over-fit prevention
-               • mosaic=0.9       kept  — multi-class co-occurrence
                • scale=0.35       kept  — small objects, tight bbox
                • label_smoothing lowered to 0.1  (was 0.5)
                  Nano has less capacity; heavy label smoothing
@@ -36,11 +26,11 @@ Classes  : bb, db, kb, medicine ball, plates  (nc=5)
                • cls weight lowered to 1.5 (was 2.0)
                  Same reason — nano needs cleaner gradients.
 
-  6. EPOCHS  ─ Default raised to 200 (was 150).
+  5. EPOCHS  ─ Default raised to 200 (was 150).
                Nano converges slower on small datasets.
                Patience raised to 50 accordingly.
 
-  7. RUN NAMING ─ Prefix changed to "v9n_" for easy MLflow
+  6. RUN NAMING ─ Prefix changed to "v9n_" for easy MLflow
                   filtering alongside v8 (medium) runs.
 
 ════════════════════════════════════════════════════════════════════
@@ -451,8 +441,8 @@ def main():
         cos_lr=True,
 
         # Loss weights (softened vs v8 for nano capacity)
-        cls=1.5,                # was 2.0 — nano needs cleaner gradients
-        label_smoothing=0.1,    # was 0.5 — heavy smoothing hurts minority classes on nano
+        cls=2.0,                # was 2.0 — nano needs cleaner gradients
+        label_smoothing=0.5,    # was 0.5 — heavy smoothing hurts minority classes on nano
 
         # Augmentation (kept from v8, proven effective for plates)
         hsv_h=0.015,
@@ -462,12 +452,8 @@ def main():
         flipud=0.0,
         degrees=5.0,
         translate=0.1,
-        scale=0.35,             # small objects — kept reduced from v8
+        scale=0.5,             # small objects — kept reduced from v8
         shear=0.0,
-        mosaic=0.9,
-        copy_paste=0.6,         # critical for plates (52 samples)
-        erasing=0.3,            # texture over-fit prevention
-        mixup=0.15,
     )
 
     with mlflow.start_run(run_name=run_name) as run:
