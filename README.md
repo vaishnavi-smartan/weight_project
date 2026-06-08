@@ -11,7 +11,8 @@ Detects 5 classes: **BB** (barbell), **DB** (dumbbell), **KB** (kettlebell), **M
 .
 ├── object_detection.py           # Model training with MLflow tracking
 ├── infer_video.py        # Real-time video inference with interactive playback controls
-├── extract_frames.py     # Extract frames from video to disk
+├── extract_frames.py       # Extract frames from video to disk
+|__infer_frames            #infer from extracted frames
 ├── sort_frames.py        # Sort extracted frames into per-class folders via YOLO inference
 ├── frame_counter.py      # Count per-class detections across all frames of a video
 ├── requirements.txt
