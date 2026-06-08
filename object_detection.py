@@ -1,84 +1,95 @@
 """
-train_v8.py  –  Gym Equipment YOLO trainer  (v8 — Dropout + 5-class)
+train_v9n.py  –  Gym Equipment YOLO trainer  (v9n — YOLOv8n + CPU-safe)
 Dataset  : Roboflow — dumbells-and-kettlebells (v15)
 Classes  : bb, db, kb, medicine ball, plates  (nc=5)
 
 ════════════════════════════════════════════════════════════════════
-  WHAT CHANGED vs v7
+  WHAT CHANGED vs v8 (yolov8m)
 ════════════════════════════════════════════════════════════════════
-  1. CLASS FIX  ─ Reverted to 5 classes (swiss ball removed).
-                  CLASS_NAMES and KNOWN_COUNTS updated accordingly.
+  1. MODEL  ─ Switched from yolov8m.pt → yolov8n.pt (nano).
+              ~8× fewer parameters (3.2M vs 25.9M).
+              Faster iteration on CPU (pc-008 has no working GPU).
+              Trade-off: lower mAP ceiling vs medium, especially
+              for small/minority classes like plates.
 
-  2. DROPOUT  ─ YOLO backbone/head don't expose a dropout arg natively,
-                so we inject it the correct way:
-                  • model.model[-1].dropout = 0.10  (head Detect layer)
-                  • A post-load hook patches every nn.Dropout in the
-                    backbone to p=BACKBONE_DROPOUT (default 0.05).
-                This regularises without changing architecture.
-                Dropout is DISABLED during val/test automatically by
-                model.eval() which Ultralytics calls internally.
+  2. BATCH  ─ Lowered default to 8 (was 16).
+              Nano fits comfortably in CPU RAM at batch=8.
+              Raise to 16 if your machine has ≥32 GB RAM.
 
-  3. EPOCH GUIDANCE (see table below) ─ with your dataset size and
-     the plates class having only ~52 samples in the val split
-     you need at minimum 120 epochs; 150 is safer.
+  3. WORKERS ─ Lowered to 2 (was 4).
+               On CPU training, excess workers add overhead
+               without throughput gain.
 
-  4. SCALE REDUCED  ─ bbox size plot shows objects cluster tightly at
-     ~0.05-0.10 w/h (small, uniform). Wide scale jitter (0.5) hurts
-     small-object recall. Dropped back to 0.35.
+  4. DROPOUT ─ Head dropout reduced to 0.05 (was 0.10).
+               Nano has fewer parameters; aggressive dropout
+               hurts convergence more than it helps regularise.
+               Backbone dropout kept at 0.0 (nano has none anyway).
 
-  5. AUGMENTATION TUNED for plates (52 samples):
-     • copy_paste raised to 0.6  (was 0.5) — critical for plates
-     • erasing=0.3 added         — prevents texture over-fitting on
-                                   the 52 plates images
-     • mixup kept at 0.15
+  5. AUGMENTATION TUNED for nano + CPU:
+               • copy_paste=0.6   kept  — still critical for plates
+               • erasing=0.3      kept  — texture over-fit prevention
+               • mosaic=0.9       kept  — multi-class co-occurrence
+               • scale=0.35       kept  — small objects, tight bbox
+               • label_smoothing lowered to 0.1  (was 0.5)
+                 Nano has less capacity; heavy label smoothing
+                 blurs the already-weak signal for minority classes.
+               • cls weight lowered to 1.5 (was 2.0)
+                 Same reason — nano needs cleaner gradients.
 
-  6. PROPER MLFLOW RUN-NAMING  ─ run name includes timestamp so
-     every run is uniquely identifiable without manual renaming.
+  6. EPOCHS  ─ Default raised to 200 (was 150).
+               Nano converges slower on small datasets.
+               Patience raised to 50 accordingly.
+
+  7. RUN NAMING ─ Prefix changed to "v9n_" for easy MLflow
+                  filtering alongside v8 (medium) runs.
 
 ════════════════════════════════════════════════════════════════════
-  EPOCH RECOMMENDATION
+  NANO vs MEDIUM — WHEN TO USE WHICH
 ════════════════════════════════════════════════════════════════════
+  ┌──────────────┬───────────┬──────────────────────────────────┐
+  │ Scenario     │ Use       │ Reason                           │
+  ├──────────────┼───────────┼──────────────────────────────────┤
+  │ Quick expt   │ nano (n)  │ 3–5× faster per epoch on CPU     │
+  │ Hyperparams  │ nano (n)  │ Cheap to iterate                 │
+  │ Best mAP     │ medium (m)│ Higher capacity for plates/MB    │
+  │ Edge deploy  │ nano (n)  │ Smaller model size (6 MB)        │
+  │ Server infer │ medium (m)│ Accuracy matters more            │
+  └──────────────┴───────────┴──────────────────────────────────┘
 
-  Your dataset: 1,776 total label instances across 5 classes.
-  Rarest class: plates ≈ 52 val instances.
-
-  Recommended epochs by use case:
+════════════════════════════════════════════════════════════════════
+  EPOCH RECOMMENDATION (nano-specific)
+════════════════════════════════════════════════════════════════════
   ┌───────────────────────────────┬────────┬──────────┐
   │ Use case                      │ epochs │ patience │
   ├───────────────────────────────┼────────┼──────────┤
   │ Quick experiment / sanity     │   50   │   20     │
-  │ Normal training run           │  120   │   40     │
-  │ Best accuracy (recommended)   │  150   │   45     │
-  │ Max (diminishing returns)     │  200   │   50     │
+  │ Normal training run           │  150   │   45     │
+  │ Best accuracy (recommended)   │  200   │   50     │
+  │ Max (diminishing returns)     │  300   │   60     │
   └───────────────────────────────┴────────┴──────────┘
-
-  Default in this script: --epochs 150  --patience 45
+  Default in this script: --epochs 200  --patience 50
 
 ════════════════════════════════════════════════════════════════════
   HOW TO RUN
 ════════════════════════════════════════════════════════════════════
-
   # 1. Activate your venv
   source /home/pc-008/weight_recognition/venv/bin/activate
 
-  # 2. Basic run (uses all defaults)
-  python train_v8.py
+  # 2. Basic run — nano, CPU, all defaults
+  python train_v9n.py
 
-  # 3. Custom model / epochs
-  python train_v8.py --model yolov8m.pt --epochs 150 --batch 16
+  # 3. Custom epochs / batch
+  python train_v9n.py --epochs 200 --batch 8
 
   # 4. Point to a specific MLflow DB
-  python train_v8.py --mlflow-uri sqlite:////home/pc-008/weight_project/mlflow.db
+  python train_v9n.py --mlflow-uri sqlite:////home/pc-008/weight_project/mlflow.db
 
   # 5. Resume interrupted run
-  python train_v8.py --resume
+  python train_v9n.py --resume
 
-  # 6. After training — launch MLflow UI
+  # 6. Compare nano vs medium in MLflow UI
   mlflow ui --backend-store-uri sqlite:///mlflow.db --port 5000
-  # Then open: http://localhost:5000
-
-  # 7. GPU check before running
-  python -c "import torch; print(torch.cuda.get_device_name(0))"
+  # Filter by tag model=yolov8n.pt  vs  model=yolov8m.pt
 
 ════════════════════════════════════════════════════════════════════
 """
@@ -99,47 +110,49 @@ from ultralytics.utils import LOGGER
 ROOT      = Path(__file__).resolve().parent
 
 DATA_YAML = str(
-    "/home/pc-008/weight_project/DB and KB Detetcion/"
-    "Dumbells and Kettlebells.v3i.yolov8/data.yaml"
+    "/home/pc-008/weight_project/DB_and_KB_Detetcion/"
+    "Dumbells_and_Kettlebells.v3i.yolov8/data.yaml"
 )
 
-# ── v8: 5 classes (swiss ball removed) ───────────────────────────────────────
 CLASS_NAMES = ["bb", "db", "kb", "medicine ball", "plates"]
 
-# Update these from your actual dataset split counts
 KNOWN_COUNTS = {
-    "bb":            429,   # val split counts from labels.jpg
+    "bb":            429,
     "db":            747,
     "kb":            442,
     "medicine ball": 106,
     "plates":         52,   # CRITICALLY LOW ⚠
 }
 
-# ── Dropout config ────────────────────────────────────────────────────────────
-HEAD_DROPOUT     = 0.10   # applied to the Detect head layer
-BACKBONE_DROPOUT = 0.05   # applied to any existing nn.Dropout in backbone
+# ── Dropout config (nano-tuned) ───────────────────────────────────────────────
+HEAD_DROPOUT     = 0.05   # reduced vs v8 (0.10) — nano has less capacity
+BACKBONE_DROPOUT = 0.0    # nano has no Dropout layers in backbone
 
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
 
 def parse_args():
-    p = argparse.ArgumentParser(description="Train YOLO on gym equipment dataset (v8)")
-    p.add_argument("--model",    default="yolov8m.pt")
-    p.add_argument("--epochs",   type=int, default=150,
-                   help="Recommended: 150 for best accuracy (see table in docstring)")
+    p = argparse.ArgumentParser(description="Train YOLOv8n on gym equipment dataset (v9n)")
+    p.add_argument("--model",    default="yolov8n.pt",         # ← nano
+                   help="Base weights. Default: yolov8n.pt")
+    p.add_argument("--epochs",   type=int, default=200,        # ← raised for nano
+                   help="Nano converges slower; 200 recommended")
     p.add_argument("--imgsz",    type=int, default=640)
-    p.add_argument("--batch",    type=int, default=16)
-    p.add_argument("--device",   default="0")
-    p.add_argument("--workers",  type=int, default=4)
+    p.add_argument("--batch",    type=int, default=8,          # ← lowered for CPU
+                   help="Batch size. 8 is safe on CPU; raise to 16 with ≥32 GB RAM")
+    p.add_argument("--device",   default="cpu",                # ← CPU default
+                   help="'cpu' or GPU id e.g. '0'")
+    p.add_argument("--workers",  type=int, default=2,          # ← lowered for CPU
+                   help="Dataloader workers. 2 is optimal for CPU training")
     p.add_argument("--project",  default=str(ROOT / "runs"))
-    p.add_argument("--name",     default="gym_equipment_v8")
+    p.add_argument("--name",     default="gym_equipment_v9n")  # ← new run prefix
     p.add_argument("--resume",   action="store_true")
-    p.add_argument("--patience", type=int, default=45)
+    p.add_argument("--patience", type=int, default=50)         # ← raised for nano
     p.add_argument("--data",     default=DATA_YAML)
     p.add_argument("--mlflow-uri",        default="sqlite:///mlflow.db")
     p.add_argument("--mlflow-experiment", default="gym_equipment_detection")
     p.add_argument("--mlflow-run-name",   default=None,
-                   help="Defaults to v8_<timestamp> for unique run IDs")
+                   help="Defaults to v9n_<timestamp>")
     p.add_argument("--head-dropout",     type=float, default=HEAD_DROPOUT)
     p.add_argument("--backbone-dropout", type=float, default=BACKBONE_DROPOUT)
     return p.parse_args()
@@ -151,7 +164,6 @@ def setup_mlflow(args):
     uri = args.mlflow_uri
     if "://" not in uri:
         uri = Path(uri).resolve().as_uri()
-
     mlflow.set_tracking_uri(uri)
     mlflow.set_experiment(args.mlflow_experiment)
     os.environ["MLFLOW_TRACKING_URI"]    = uri
@@ -165,48 +177,43 @@ def _safe_params(d: dict) -> dict:
 
 # ── Dropout injection ─────────────────────────────────────────────────────────
 
-def inject_dropout(model: YOLO, head_p: float = 0.10, backbone_p: float = 0.05):
+def inject_dropout(model: YOLO, head_p: float = 0.05, backbone_p: float = 0.0):
     """
-    Inject dropout into a YOLOv8 model.
+    Inject dropout into YOLOv8n.
 
-    Strategy:
-    ──────────
-    1. Detect head  → set model.model[-1].dropout  (Ultralytics exposes this attr)
-    2. Backbone     → patch any existing nn.Dropout layers to backbone_p
-       (YOLOv8n/s/m don't have dropout in backbone by default, but this
-        future-proofs for variants that do, and handles custom models)
+    YOLOv8n has NO Dropout layers in its backbone by default.
+    Only the Detect head exposes a .dropout attribute.
 
-    NOTE: dropout is automatically disabled during val/test because
-    Ultralytics calls model.eval() before every validation pass.
-    You do NOT need to manage this manually.
+    head_p=0.05 is intentionally lower than the medium model (0.10)
+    because nano's smaller capacity makes it more sensitive to
+    regularisation-induced underfitting.
     """
-    nn_model = model.model  # DetectionModel (torch.nn.Module)
-
-    # ── 1. Head dropout ───────────────────────────────────────────────────────
+    nn_model    = model.model
     detect_head = nn_model.model[-1]
+
+    # ── Head dropout ──────────────────────────────────────────────────────────
     if hasattr(detect_head, "dropout"):
         old_p = detect_head.dropout
         detect_head.dropout = head_p
         LOGGER.info(f"[Dropout] Detect head: {old_p} → {head_p}")
     else:
         LOGGER.warning(
-            f"[Dropout] model[-1] has no .dropout attr "
-            f"(model type: {type(detect_head).__name__}). "
-            f"Skipping head dropout — upgrade ultralytics if you need it."
+            f"[Dropout] model[-1] ({type(detect_head).__name__}) has no .dropout attr. "
+            f"Skipping — upgrade ultralytics if needed."
         )
 
-    # ── 2. Backbone dropout ───────────────────────────────────────────────────
+    # ── Backbone dropout (informational only for nano) ────────────────────────
     patched = 0
-    for module in nn_model.model.modules():
-        if isinstance(module, nn.Dropout):
-            module.p = backbone_p
-            patched += 1
+    if backbone_p > 0.0:
+        for module in nn_model.model.modules():
+            if isinstance(module, nn.Dropout):
+                module.p = backbone_p
+                patched += 1
 
     if patched:
-        LOGGER.info(f"[Dropout] Patched {patched} existing backbone Dropout layers → p={backbone_p}")
+        LOGGER.info(f"[Dropout] Patched {patched} backbone Dropout layers → p={backbone_p}")
     else:
-        LOGGER.info(f"[Dropout] No existing Dropout layers in backbone "
-                    f"(normal for YOLOv8n/s/m — head dropout only)")
+        LOGGER.info("[Dropout] No backbone Dropout layers (expected for YOLOv8n — head only)")
 
     return model
 
@@ -251,11 +258,10 @@ def check_class_distribution(data_yaml: str) -> Counter:
     total  = sum(counts.values()) or 1
     nc_cfg = cfg.get("nc", len(names))
 
-    # ── Warn if nc in data.yaml doesn't match CLASS_NAMES ────────────────────
     if nc_cfg != len(CLASS_NAMES):
         LOGGER.warning(
-            f"[Distribution] data.yaml has nc={nc_cfg} but CLASS_NAMES has "
-            f"{len(CLASS_NAMES)} entries. Update CLASS_NAMES or data.yaml!"
+            f"[Distribution] data.yaml nc={nc_cfg} but CLASS_NAMES has "
+            f"{len(CLASS_NAMES)} entries. Sync them!"
         )
 
     print("\n" + "═" * 70)
@@ -265,7 +271,6 @@ def check_class_distribution(data_yaml: str) -> Counter:
         name = names[cls_id] if isinstance(names, list) else names.get(cls_id, str(cls_id))
         pct  = 100 * cnt / total
         bar  = "█" * int(30 * cnt / total)
-
         if pct < 3:
             flag = "  🔴 CRITICAL (<3%) — heavy oversampling needed"
         elif pct < 6:
@@ -274,21 +279,18 @@ def check_class_distribution(data_yaml: str) -> Counter:
             flag = "  🟡 LOW (<10%) — monitor per-class AP50"
         else:
             flag = ""
-
         print(f"  {name:>15} (cls {cls_id}): {cnt:>5}  {bar:<30}  {pct:5.1f}%{flag}")
-
     print(f"  {'TOTAL':>15}         : {total:>5}")
     print("═" * 70 + "\n")
 
-    # ── Epoch suggestion based on rarest class ────────────────────────────────
     if counts:
         min_count = min(counts.values())
         if min_count < 30:
             print(f"  ⚠ Rarest class has only {min_count} samples.")
-            print(f"    → Strongly recommend: --epochs 150 --patience 45")
+            print(f"    → Strongly recommend: --epochs 200 --patience 50")
         elif min_count < 100:
             print(f"  ⚠ Rarest class has {min_count} samples.")
-            print(f"    → Recommend: --epochs 120 --patience 40")
+            print(f"    → Recommend: --epochs 150 --patience 45")
         print()
 
     return counts
@@ -340,7 +342,6 @@ def make_callbacks():
             except Exception:
                 pass
 
-        # ── Per-class AP50 mid-training (if available) ────────────────────────
         validator = getattr(trainer, "validator", None)
         if validator:
             box = getattr(getattr(validator, "metrics", None), "box", None)
@@ -434,28 +435,7 @@ def main():
     args = parse_args()
     uri  = setup_mlflow(args)
 
-    # Auto-generate unique run name with timestamp
-    run_name = args.mlflow_run_name or f"v8_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-
-    # ── Augmentation config ───────────────────────────────────────────────────
-    #
-    # KEY CHANGES vs v7:
-    #
-    # copy_paste=0.6  (was 0.5)
-    #   plates has only ~52 samples — this is the single most impactful
-    #   augmentation for minority classes. Pastes instances from other images.
-    #
-    # erasing=0.3  (new)
-    #   Random erasing prevents the model from memorising the exact textures
-    #   of the 52 plates training images. Acts like dropout at the data level.
-    #
-    # scale=0.35  (was 0.5)
-    #   labels.jpg width/height plot shows objects are SMALL (0.05-0.10).
-    #   Aggressive scale jitter (0.5) crops them out of frame. Reduced.
-    #
-    # mosaic=0.9  (was 0.85)
-    #   More mosaic → more multi-class scenes per image → better co-occurrence
-    #   learning (plates next to db/kb teaches spatial context).
+    run_name = args.mlflow_run_name or f"v9n_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
 
     train_kwargs = dict(
         data=args.data,
@@ -470,10 +450,11 @@ def main():
         patience=args.patience,
         cos_lr=True,
 
-        # Loss weights
-        cls=2.0,
-        label_smoothing=0.5,
-        # Augmentation
+        # Loss weights (softened vs v8 for nano capacity)
+        cls=1.5,                # was 2.0 — nano needs cleaner gradients
+        label_smoothing=0.1,    # was 0.5 — heavy smoothing hurts minority classes on nano
+
+        # Augmentation (kept from v8, proven effective for plates)
         hsv_h=0.015,
         hsv_s=0.7,
         hsv_v=0.4,
@@ -481,8 +462,12 @@ def main():
         flipud=0.0,
         degrees=5.0,
         translate=0.1,
-        scale=0.5,
+        scale=0.35,             # small objects — kept reduced from v8
         shear=0.0,
+        mosaic=0.9,
+        copy_paste=0.6,         # critical for plates (52 samples)
+        erasing=0.3,            # texture over-fit prevention
+        mixup=0.15,
     )
 
     with mlflow.start_run(run_name=run_name) as run:
@@ -490,24 +475,29 @@ def main():
 
         mlflow.set_tags({
             "dataset":          "dumbells-and-kettlebells-v15",
-            "fix_version":      "v8",
+            "fix_version":      "v9n",
+            "model_size":       "nano",
             "fix_target":       "plates_mb_confusion",
             "imbalanced_cls":   "plates,medicine_ball",
             "model":            args.model,
             "dropout_head":     str(args.head_dropout),
             "dropout_backbone": str(args.backbone_dropout),
             "num_classes":      "5",
+            "device":           args.device,
         })
 
         print("\n" + "═" * 65)
-        print("  MLflow run started — v8")
+        print("  MLflow run started — v9n  (YOLOv8 nano)")
         print("═" * 65)
         print(f"  tracking_uri  : {uri}")
         print(f"  experiment    : {args.mlflow_experiment}")
         print(f"  run_id        : {run_id}")
         print(f"  run_name      : {run_name}")
+        print(f"  model         : {args.model}  (nano — {3.2}M params)")
+        print(f"  device        : {args.device}")
         print(f"  dropout       : head={args.head_dropout}, backbone={args.backbone_dropout}")
         print(f"  epochs        : {args.epochs} (patience={args.patience})")
+        print(f"  batch         : {args.batch}")
         print("═" * 65 + "\n")
 
         # ── Class distribution ────────────────────────────────────────────────
@@ -530,7 +520,8 @@ def main():
             "dataset":           "dumbells-and-kettlebells-v15",
             "num_classes":       5,
             "classes":           ",".join(CLASS_NAMES),
-            "fix_version":       "v8",
+            "fix_version":       "v9n",
+            "model_size":        "nano",
             "head_dropout":      args.head_dropout,
             "backbone_dropout":  args.backbone_dropout,
             **train_kwargs,
@@ -542,8 +533,7 @@ def main():
         # ── Inject dropout ────────────────────────────────────────────────────
         inject_dropout(model, head_p=args.head_dropout, backbone_p=args.backbone_dropout)
 
-        # ── Log dropout confirmation to MLflow ────────────────────────────────
-        detect_head = model.model.model[-1]
+        detect_head         = model.model.model[-1]
         actual_head_dropout = getattr(detect_head, "dropout", "N/A")
         mlflow.log_param("actual_head_dropout", str(actual_head_dropout))
         LOGGER.info(f"[Dropout] Confirmed head dropout = {actual_head_dropout}")
@@ -577,12 +567,10 @@ def main():
             "test/recall":    float(box.mr),
         }
 
-        # Per-class AP50  ← most useful for diagnosing plates / medicine ball confusion
         if hasattr(box, "ap50") and box.ap50 is not None:
             for cls_name, ap in zip(CLASS_NAMES, box.ap50.tolist()):
                 test_metrics[f"test/AP50_{cls_name}"] = float(ap)
 
-        # Per-class AP50-95
         if hasattr(box, "ap") and box.ap is not None:
             try:
                 for cls_name, ap in zip(CLASS_NAMES, box.ap.tolist()):
@@ -591,13 +579,11 @@ def main():
                 pass
 
         mlflow.log_metrics(test_metrics)
-
-        # ── Upload plots + weights ────────────────────────────────────────────
         log_run_artifacts(save_dir)
 
         # ── Print summary ─────────────────────────────────────────────────────
         print("\n" + "═" * 65)
-        print("  TEST METRICS")
+        print("  TEST METRICS  (YOLOv8n)")
         print("═" * 65)
         print(f"  {'mAP50':>20} : {test_metrics.get('test/mAP50', 0):.4f}")
         print(f"  {'mAP50-95':>20} : {test_metrics.get('test/mAP50-95', 0):.4f}")
@@ -610,7 +596,7 @@ def main():
             if key in test_metrics:
                 v   = test_metrics[key]
                 bar = "█" * int(40 * v)
-                lvl = ("🔴" if v < 0.3 else "🟡" if v < 0.5 else "🟢")
+                lvl = "🔴" if v < 0.3 else "🟡" if v < 0.5 else "🟢"
                 print(f"  {cls_name:>15} : {v:.4f}  {bar:<40}  {lvl}")
         print("═" * 65)
         print(f"\n  MLflow run_id  : {run_id}")
@@ -618,13 +604,14 @@ def main():
         print(f"\n  ► mlflow ui --backend-store-uri {uri} --port 5000")
         print()
 
-        # ── Final plates warning if AP50 is low ──────────────────────────────
+        # ── Plates warning ────────────────────────────────────────────────────
         plates_ap = test_metrics.get("test/AP50_plates", None)
         if plates_ap is not None and plates_ap < 0.4:
-            print("  ⚠  plates AP50 is low. Options:")
+            print("  ⚠  plates AP50 is low. Options for nano:")
             print("     1. Collect more plates images (aim for ≥200)")
-            print("     2. Raise --epochs to 200 and re-run")
-            print("     3. Use focal loss: add fl_gamma=2.0 to train_kwargs")
+            print("     2. Raise --epochs to 300 and re-run")
+            print("     3. Switch to yolov8s.pt or yolov8m.pt for higher capacity")
+            print("     4. Use focal loss: add fl_gamma=2.0 to train_kwargs")
             print()
 
 
