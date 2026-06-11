@@ -1,0 +1,584 @@
+"""
+train_v8n_gpu.py  –  Gym Equipment YOLO trainer  (v8n — YOLOv8n + Head Dropout + 5-class)
+Dataset  : Roboflow — dumbells-and-kettlebells (v15)
+Classes  : bb, db, kb, medicine ball, plates  (nc=5)
+
+════════════════════════════════════════════════════════════════════
+  CHANGES vs train_v8n.py (CPU version)
+════════════════════════════════════════════════════════════════════
+  1. DEVICE       ─ "cpu" → auto-detect GPU ("0" if CUDA available,
+                   fallback to "cpu" if not). Override via --device.
+
+  2. BATCH        ─ 8 → 16  (GPU has enough VRAM; reduce if OOM)
+
+  3. WORKERS      ─ 2 → 4   (GPU training benefits from more prefetch)
+
+  4. AMP          ─ added amp=True for mixed-precision (2× speed on GPU)
+
+  5. MLFLOW FIX   ─ Removed Ultralytics built-in MLflow callback BEFORE
+                   model.train() to prevent duplicate/conflicting logs.
+                   Custom callbacks log: train loss, val metrics,
+                   per-class AP50 every epoch, and final test metrics.
+
+  6. ARTIFACT LOG ─ best.pt, last.pt, results.csv, all curve PNGs,
+                   confusion matrix logged to MLflow after training.
+
+  7. GPU MONITOR  ─ logs GPU name and VRAM as MLflow tags at run start.
+
+════════════════════════════════════════════════════════════════════
+  HOW TO RUN
+════════════════════════════════════════════════════════════════════
+
+  # 1. Activate venv
+  source /home/pc-008/weight_recognition/venv/bin/activate
+
+  # 2. Basic run — auto-detects GPU
+  python train_v8n_gpu.py
+
+  # 3. Force specific GPU
+  python train_v8n_gpu.py --device 0
+
+  # 4. Force CPU (debug/fallback)
+  python train_v8n_gpu.py --device cpu
+
+  # 5. Custom epochs/batch
+  python train_v8n_gpu.py --epochs 200 --batch 16
+
+  # 6. View MLflow UI after training
+  mlflow ui \
+    --backend-store-uri sqlite:////home/pc-008/weight_project/mlflow.db \
+    --port 5000
+
+════════════════════════════════════════════════════════════════════
+  GPU BATCH SIZE GUIDE
+════════════════════════════════════════════════════════════════════
+  ┌──────────────────┬────────┬────────────────────────────────────┐
+  │ VRAM             │ Batch  │ Notes                              │
+  ├──────────────────┼────────┼────────────────────────────────────┤
+  │ 4 GB             │   8    │ Safe minimum for YOLOv8n           │
+  │ 6 GB             │  16    │ Default in this script             │
+  │ 8 GB             │  32    │ Faster convergence                 │
+  │ 12 GB+           │  64    │ Use -1 to let YOLO auto-batch      │
+  └──────────────────┴────────┴────────────────────────────────────┘
+  Tip: pass --batch -1 to let Ultralytics auto-select batch size.
+
+════════════════════════════════════════════════════════════════════
+"""
+
+import argparse
+import os
+from collections import Counter
+from datetime import datetime
+from pathlib import Path
+
+import mlflow
+import yaml
+from ultralytics import YOLO
+from ultralytics.utils import LOGGER
+
+# ── GPU auto-detection ────────────────────────────────────────────────────────
+try:
+    import torch
+    _CUDA_AVAILABLE = torch.cuda.is_available()
+    _GPU_COUNT      = torch.cuda.device_count()
+except ImportError:
+    _CUDA_AVAILABLE = False
+    _GPU_COUNT      = 0
+
+ROOT = Path(__file__).resolve().parent
+
+DATA_YAML = (
+    "/home/pc-008/weight_project/DB_and_KB_Detetcion/"
+    "Dumbells and Kettlebells.v17i.yolov8/data.yaml"
+)
+
+CLASS_NAMES = ["bb", "db", "kb", "medicine ball", "plates"]
+
+KNOWN_COUNTS = {
+    "bb":            429,
+    "db":            747,
+    "kb":            442,
+    "medicine ball": 106,
+    "plates":         52,   # CRITICALLY LOW ⚠
+}
+
+HEAD_DROPOUT = 0.05
+
+
+# ── CLI ───────────────────────────────────────────────────────────────────────
+
+def parse_args():
+    # ── CHANGE: default device = "0" if GPU available, else "cpu" ────────────
+    default_device = "0" if _CUDA_AVAILABLE else "cpu"
+    # ── CHANGE: batch 16 for GPU (was 8 for CPU) ─────────────────────────────
+    default_batch  = 16 if _CUDA_AVAILABLE else 8
+    # ── CHANGE: workers 4 for GPU (was 2 for CPU) ────────────────────────────
+    default_workers = 4 if _CUDA_AVAILABLE else 2
+
+    p = argparse.ArgumentParser(description="Train YOLOv8n on gym equipment (GPU)")
+    p.add_argument("--model",    default="yolov8n.pt")
+    p.add_argument("--epochs",   type=int, default=200)
+    p.add_argument("--imgsz",    type=int, default=640)
+    p.add_argument("--batch",    type=int, default=default_batch,
+                   help="Batch size. -1 = YOLO auto-batch (GPU only). Default: 16 (GPU) / 8 (CPU)")
+    p.add_argument("--device",   default=default_device,
+                   help=f"Device: '0','1' for GPU, 'cpu'. Auto-detected: '{default_device}'")
+    p.add_argument("--workers",  type=int, default=default_workers)
+    p.add_argument("--project",  default=str(ROOT / "runs"))
+    p.add_argument("--name",     default="gym_equipment_v8n_gpu")
+    p.add_argument("--resume",   action="store_true")
+    p.add_argument("--patience", type=int, default=50)
+    p.add_argument("--data",     default=DATA_YAML)
+    p.add_argument("--mlflow-uri",
+                   default="sqlite:////home/pc-008/weight_project/mlflow.db")
+    p.add_argument("--mlflow-experiment", default="gym_equipment_detection")
+    p.add_argument("--mlflow-run-name",   default=None)
+    p.add_argument("--head-dropout", type=float, default=HEAD_DROPOUT)
+    # ── CHANGE: AMP flag for mixed precision on GPU ───────────────────────────
+    p.add_argument("--amp",      action="store_true", default=True,
+                   help="Mixed-precision training (GPU only). ~2x speed boost.")
+    p.add_argument("--no-amp",   dest="amp", action="store_false",
+                   help="Disable AMP (use if you get AMP-related errors)")
+    return p.parse_args()
+
+
+# ── GPU info ──────────────────────────────────────────────────────────────────
+
+def get_gpu_info(device: str) -> dict:
+    """Return GPU name and VRAM for MLflow tags."""
+    # ── CHANGE: new helper — logs GPU info to MLflow ─────────────────────────
+    info = {"gpu_available": str(_CUDA_AVAILABLE), "gpu_count": str(_GPU_COUNT)}
+    if _CUDA_AVAILABLE and device != "cpu":
+        try:
+            import torch
+            idx = int(device) if device.isdigit() else 0
+            info["gpu_name"]      = torch.cuda.get_device_name(idx)
+            info["gpu_vram_gb"]   = str(
+                round(torch.cuda.get_device_properties(idx).total_memory / 1e9, 1)
+            )
+        except Exception as e:
+            info["gpu_info_error"] = str(e)
+    return info
+
+
+# ── MLflow setup ──────────────────────────────────────────────────────────────
+
+def setup_mlflow(args):
+    uri = args.mlflow_uri
+    if "://" not in uri:
+        uri = "sqlite:///" + str(Path(uri).resolve())
+
+    mlflow.set_tracking_uri(uri)
+    mlflow.set_experiment(args.mlflow_experiment)
+    os.environ["MLFLOW_TRACKING_URI"]    = uri
+    os.environ["MLFLOW_EXPERIMENT_NAME"] = args.mlflow_experiment
+
+    print(f"[MLflow] Tracking URI : {uri}")
+    return uri
+
+
+def _safe_params(d: dict) -> dict:
+    return {k: str(v) for k, v in d.items()}
+
+
+# ── Head-only dropout injection ───────────────────────────────────────────────
+
+def inject_dropout(model: YOLO, head_p: float = 0.05):
+    detect_head = model.model.model[-1]
+    if hasattr(detect_head, "dropout"):
+        old_p = detect_head.dropout
+        detect_head.dropout = head_p
+        LOGGER.info(f"[Dropout] Detect head: {old_p} → {head_p}")
+    else:
+        LOGGER.warning(
+            f"[Dropout] model[-1] ({type(detect_head).__name__}) has no .dropout attr. "
+            "Skipping."
+        )
+    return model
+
+
+# ── Class distribution check ──────────────────────────────────────────────────
+
+def check_class_distribution(data_yaml: str) -> Counter:
+    with open(data_yaml) as f:
+        cfg = yaml.safe_load(f)
+
+    train_path = Path(cfg.get("train", ""))
+    yaml_dir   = Path(data_yaml).parent
+    if not train_path.is_absolute():
+        train_path = (yaml_dir / train_path).resolve()
+
+    candidates = [
+        train_path.parent.parent / "labels" / "train",
+        train_path.parent / "labels" / "train",
+        train_path.parent / "labels",
+        Path(str(train_path).replace("/images/", "/labels/")),
+        yaml_dir / "labels" / "train",
+        yaml_dir / "train" / "labels",
+    ]
+    label_path = next((c for c in candidates if c.exists()), None)
+
+    if label_path is None:
+        LOGGER.warning("[Distribution] Could not locate label directory.")
+        return Counter()
+
+    counts: Counter = Counter()
+    for lf in label_path.glob("*.txt"):
+        for line in lf.read_text().splitlines():
+            if line.strip():
+                try:
+                    counts[int(line.split()[0])] += 1
+                except (ValueError, IndexError):
+                    pass
+
+    names  = cfg.get("names", CLASS_NAMES)
+    total  = sum(counts.values()) or 1
+    nc_cfg = cfg.get("nc", len(names))
+
+    if nc_cfg != len(CLASS_NAMES):
+        LOGGER.warning(f"[Distribution] data.yaml nc={nc_cfg} ≠ CLASS_NAMES {len(CLASS_NAMES)}")
+
+    print("\n" + "═" * 70)
+    print("  CLASS DISTRIBUTION — training split")
+    print("═" * 70)
+    for cls_id, cnt in sorted(counts.items()):
+        name = names[cls_id] if isinstance(names, list) else names.get(cls_id, str(cls_id))
+        pct  = 100 * cnt / total
+        bar  = "█" * int(30 * cnt / total)
+        if pct < 3:   flag = "  🔴 CRITICAL (<3%)"
+        elif pct < 6: flag = "  🟠 VERY LOW (<6%)"
+        elif pct < 10:flag = "  🟡 LOW (<10%)"
+        else:         flag = ""
+        print(f"  {name:>15} (cls {cls_id}): {cnt:>5}  {bar:<30}  {pct:5.1f}%{flag}")
+    print(f"  {'TOTAL':>15}         : {total:>5}")
+    print("═" * 70 + "\n")
+    return counts
+
+
+# ── Per-epoch MLflow callbacks ────────────────────────────────────────────────
+# ── CHANGE: callbacks are cleaner — no duplicate metric keys, all logged ──────
+
+def make_callbacks():
+    def on_train_epoch_end(trainer):
+        """Log training losses every epoch."""
+        epoch    = trainer.epoch + 1
+        log_dict = {}
+
+        if hasattr(trainer, "tloss") and trainer.tloss is not None:
+            try:
+                log_dict["train/loss_total"] = float(trainer.tloss)
+            except Exception:
+                pass
+
+        if hasattr(trainer, "loss_items") and trainer.loss_items is not None:
+            try:
+                items = trainer.loss_items.detach().cpu().tolist()
+                for name, val in zip(
+                    ["train/box_loss", "train/cls_loss", "train/dfl_loss"], items
+                ):
+                    log_dict[name] = float(val)
+            except Exception:
+                pass
+
+        # ── CHANGE: log LR per param group ───────────────────────────────────
+        lr = getattr(trainer, "lr", None)
+        if lr:
+            try:
+                for i, lr_val in enumerate(lr.values()):
+                    log_dict[f"train/lr_pg{i}"] = float(lr_val)
+            except Exception:
+                pass
+
+        # ── CHANGE: log GPU memory usage every epoch ──────────────────────────
+        if _CUDA_AVAILABLE:
+            try:
+                import torch
+                log_dict["gpu/memory_allocated_gb"] = round(
+                    torch.cuda.memory_allocated() / 1e9, 3
+                )
+                log_dict["gpu/memory_reserved_gb"] = round(
+                    torch.cuda.memory_reserved() / 1e9, 3
+                )
+            except Exception:
+                pass
+
+        if log_dict:
+            mlflow.log_metrics(log_dict, step=epoch)
+
+    def on_fit_epoch_end(trainer):
+        """Log val metrics + per-class AP50 every epoch."""
+        epoch    = trainer.epoch + 1
+        log_dict = {}
+
+        metrics = getattr(trainer, "metrics", None) or {}
+        for k, v in metrics.items():
+            try:
+                clean_key = k.replace("(B)", "").strip()
+                log_dict[clean_key] = float(v)
+            except Exception:
+                pass
+
+        # ── CHANGE: per-class AP50 logged every epoch (not just at test) ─────
+        validator = getattr(trainer, "validator", None)
+        if validator:
+            box = getattr(getattr(validator, "metrics", None), "box", None)
+            if box and hasattr(box, "ap50") and box.ap50 is not None:
+                try:
+                    for cls_name, ap in zip(CLASS_NAMES, box.ap50.tolist()):
+                        log_dict[f"val/AP50_{cls_name}"] = float(ap)
+                except Exception:
+                    pass
+            # ── CHANGE: also log mAP50 and mAP50-95 directly each epoch ──────
+            if box is not None:
+                try:
+                    log_dict["val/mAP50"]    = float(box.map50)
+                    log_dict["val/mAP50-95"] = float(box.map)
+                    log_dict["val/precision"]= float(box.mp)
+                    log_dict["val/recall"]   = float(box.mr)
+                except Exception:
+                    pass
+
+        if log_dict:
+            mlflow.log_metrics(log_dict, step=epoch)
+            LOGGER.info(f"[MLflow] epoch {epoch} → {list(log_dict.keys())}")
+
+    return {
+        "on_train_epoch_end": on_train_epoch_end,
+        "on_fit_epoch_end":   on_fit_epoch_end,
+    }
+
+
+# ── CHANGE: strip built-in MLflow callbacks BEFORE training ──────────────────
+# The original script stripped them at on_pretrain_routine_start (too late —
+# Ultralytics registers its own mlflow callbacks before that event fires).
+# Now we strip immediately after model load, before model.train() is called.
+
+def remove_builtin_mlflow_callbacks(model: YOLO):
+    """
+    Strip Ultralytics' built-in MLflow callbacks immediately after model load.
+    Must be called BEFORE model.train() to prevent duplicate logging.
+    """
+    removed = 0
+    for event in list(model.callbacks.keys()):
+        before = len(model.callbacks[event])
+        model.callbacks[event] = [
+            fn for fn in model.callbacks[event]
+            if "mlflow" not in getattr(fn, "__module__", "").lower()
+        ]
+        removed += before - len(model.callbacks[event])
+
+    if removed:
+        LOGGER.info(f"[MLflow] Stripped {removed} built-in Ultralytics MLflow callback(s)")
+    else:
+        LOGGER.info("[MLflow] No built-in Ultralytics MLflow callbacks found (already clean)")
+
+
+# ── Artifact logging ──────────────────────────────────────────────────────────
+
+def log_run_artifacts(save_dir: Path):
+    if not save_dir.exists():
+        LOGGER.warning(f"[MLflow] save_dir {save_dir} not found — skipping artifacts")
+        return
+
+    for name in (
+        "results.png", "results.csv",
+        "confusion_matrix.png", "confusion_matrix_normalized.png",
+        "PR_curve.png", "P_curve.png", "R_curve.png", "F1_curve.png",
+        "labels.jpg", "labels_correlogram.jpg",
+        "args.yaml",
+    ):
+        f = save_dir / name
+        if f.exists():
+            mlflow.log_artifact(str(f))
+
+    for wname in ("best.pt", "last.pt"):
+        w = save_dir / "weights" / wname
+        if w.exists():
+            mlflow.log_artifact(str(w), artifact_path="weights")
+            LOGGER.info(f"[MLflow] weight logged: {wname}  ({w.stat().st_size / 1e6:.1f} MB)")
+
+
+# ── Main ──────────────────────────────────────────────────────────────────────
+
+def main():
+    args = parse_args()
+    uri  = setup_mlflow(args)
+
+    # ── CHANGE: print GPU status at start ────────────────────────────────────
+    if _CUDA_AVAILABLE and args.device != "cpu":
+        import torch
+        idx = int(args.device) if str(args.device).isdigit() else 0
+        print(f"\n[GPU] ✅ Using: {torch.cuda.get_device_name(idx)}  "
+              f"({torch.cuda.get_device_properties(idx).total_memory / 1e9:.1f} GB VRAM)")
+        print(f"[GPU] AMP (mixed precision): {'ON ⚡' if args.amp else 'OFF'}")
+    else:
+        print(f"\n[GPU] ⚠ Running on CPU (CUDA available: {_CUDA_AVAILABLE})")
+
+    run_name = args.mlflow_run_name or f"v8n_gpu_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+
+    train_kwargs = dict(
+        data=args.data,
+        epochs=args.epochs,
+        imgsz=args.imgsz,
+        batch=args.batch,
+        device=args.device,
+        workers=args.workers,
+        project=args.project,
+        name=args.name,
+        resume=args.resume,
+        patience=args.patience,
+        cos_lr=True,
+        # ── CHANGE: amp=True enables mixed precision on GPU ───────────────────
+        amp=args.amp if args.device != "cpu" else False,
+
+        # Loss
+        cls=2.0,
+        label_smoothing=0.5,
+
+        # Augmentation (same as CPU version — proven for plates)
+        hsv_h=0.015,
+        hsv_s=0.7,
+        hsv_v=0.4,
+        fliplr=0.5,
+        flipud=0.0,
+        degrees=5.0,
+        translate=0.1,
+        scale=0.35,
+        mosaic=0.5,
+    )
+
+    with mlflow.start_run(run_name=run_name) as run:
+        run_id = run.info.run_id
+
+        # ── CHANGE: log GPU info as MLflow tags ───────────────────────────────
+        gpu_info = get_gpu_info(str(args.device))
+        mlflow.set_tags({
+            "dataset":        "dumbells-and-kettlebells-v15",
+            "fix_version":    "v8n_gpu",
+            "model_size":     "nano",
+            "model":          args.model,
+            "dropout_head":   str(args.head_dropout),
+            "num_classes":    "5",
+            "device":         str(args.device),
+            "amp":            str(args.amp),
+            **gpu_info,                         # ← GPU name, VRAM, count
+        })
+
+        print("\n" + "═" * 65)
+        print("  MLflow run started — v8n GPU")
+        print("═" * 65)
+        print(f"  tracking_uri  : {uri}")
+        print(f"  run_id        : {run_id}")
+        print(f"  run_name      : {run_name}")
+        print(f"  device        : {args.device}  |  AMP: {args.amp}")
+        print(f"  epochs        : {args.epochs}  (patience={args.patience})")
+        print(f"  batch         : {args.batch}")
+        print("═" * 65 + "\n")
+
+        # Class distribution
+        counts = check_class_distribution(args.data)
+        if counts:
+            mlflow.log_params(_safe_params({
+                f"cls_count/{CLASS_NAMES[i] if i < len(CLASS_NAMES) else i}": v
+                for i, v in counts.items()
+            }))
+            max_count = max(counts.values())
+            mlflow.log_params(_safe_params({
+                f"cls_imbalance_ratio/{CLASS_NAMES[i] if i < len(CLASS_NAMES) else i}":
+                    round(max_count / v, 2) if v > 0 else 999
+                for i, v in counts.items()
+            }))
+
+        mlflow.log_params(_safe_params({
+            "base_model":    args.model,
+            "dataset":       "dumbells-and-kettlebells-v15",
+            "num_classes":   5,
+            "classes":       ",".join(CLASS_NAMES),
+            "fix_version":   "v8n_gpu",
+            "head_dropout":  args.head_dropout,
+            "amp":           args.amp,
+            **train_kwargs,
+        }))
+
+        # Build model
+        model = YOLO(args.model)
+
+        # Inject head dropout
+        inject_dropout(model, head_p=args.head_dropout)
+        actual_head_dropout = getattr(model.model.model[-1], "dropout", "N/A")
+        mlflow.log_param("actual_head_dropout", str(actual_head_dropout))
+
+        # ── CHANGE: strip built-in MLflow callbacks immediately ───────────────
+        remove_builtin_mlflow_callbacks(model)
+
+        # Register custom per-epoch callbacks
+        for event, fn in make_callbacks().items():
+            model.add_callback(event, fn)
+
+        # Train
+        results = model.train(**train_kwargs)
+
+        save_dir = None
+        if results is not None:
+            save_dir = Path(getattr(results, "save_dir", "") or "")
+        if not save_dir or not save_dir.exists():
+            save_dir = Path(getattr(model.trainer, "save_dir", "."))
+        mlflow.log_param("save_dir", str(save_dir))
+
+        # Final test-split evaluation
+        print("\n[MLflow] Running final test-split evaluation...")
+        test_results = model.val(data=args.data, split="test")
+        box = test_results.box
+
+        test_metrics = {
+            "test/mAP50":     float(box.map50),
+            "test/mAP50-95":  float(box.map),
+            "test/precision": float(box.mp),
+            "test/recall":    float(box.mr),
+        }
+        if hasattr(box, "ap50") and box.ap50 is not None:
+            for cls_name, ap in zip(CLASS_NAMES, box.ap50.tolist()):
+                test_metrics[f"test/AP50_{cls_name}"] = float(ap)
+        if hasattr(box, "ap") and box.ap is not None:
+            try:
+                for cls_name, ap in zip(CLASS_NAMES, box.ap.tolist()):
+                    test_metrics[f"test/AP_{cls_name}"] = float(ap)
+            except Exception:
+                pass
+
+        mlflow.log_metrics(test_metrics)
+        log_run_artifacts(save_dir)
+
+        # Summary
+        print("\n" + "═" * 65)
+        print("  TEST METRICS  (YOLOv8n GPU)")
+        print("═" * 65)
+        print(f"  {'mAP50':>20} : {test_metrics.get('test/mAP50', 0):.4f}")
+        print(f"  {'mAP50-95':>20} : {test_metrics.get('test/mAP50-95', 0):.4f}")
+        print(f"  {'Precision':>20} : {test_metrics.get('test/precision', 0):.4f}")
+        print(f"  {'Recall':>20} : {test_metrics.get('test/recall', 0):.4f}")
+        print()
+        print("  Per-class AP50:")
+        for cls_name in CLASS_NAMES:
+            key = f"test/AP50_{cls_name}"
+            if key in test_metrics:
+                v   = test_metrics[key]
+                bar = "█" * int(40 * v)
+                lvl = "🔴" if v < 0.3 else "🟡" if v < 0.5 else "🟢"
+                print(f"  {cls_name:>15} : {v:.4f}  {bar:<40}  {lvl}")
+        print("═" * 65)
+        print(f"\n  MLflow run_id  : {run_id}")
+        print(f"  Best weights   : {save_dir / 'weights' / 'best.pt'}")
+        print(f"\n  ► mlflow ui --backend-store-uri {uri} --port 5000\n")
+
+        plates_ap = test_metrics.get("test/AP50_plates", None)
+        if plates_ap is not None and plates_ap < 0.4:
+            print("  ⚠  plates AP50 still low. Next steps:")
+            print("     1. Collect more plates images (aim ≥200 instances)")
+            print("     2. Add fl_gamma=2.0 (focal loss) to train_kwargs")
+            print("     3. Try yolov8s.pt for more capacity")
+            print()
+
+
+if __name__ == "__main__":
+    main()
